@@ -1,0 +1,9 @@
+.idea/
+.vscode/
+.env
+.env.*
+!.env.example
+/bin/
+*.exe
+*.test
+*.out
