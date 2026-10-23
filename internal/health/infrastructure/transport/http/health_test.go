@@ -87,4 +87,20 @@ func TestHealthEndpointGeneratesTraceIDWhenMissing(t *testing.T) {
 	}
 }
 
+func TestHealthEndpointReturnsServiceUnavailableWhenUnhealthy(t *testing.T) {
+	useCase := &staticHealthReader{result: domain.NewUnhealthyStatus()}
+	handler := NewRouter(slog.New(slog.NewTextHandler(io.Discard, nil)), useCase)
+	request := httptest.NewRequest(http.MethodGet, "/health", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status %d, got %d", http.StatusServiceUnavailable, response.Code)
+	}
+	if body := strings.TrimSpace(response.Body.String()); body != `{"status":"error"}` {
+		t.Fatalf("expected unhealthy response body, got %q", body)
+	}
+}
+
 var _ application.HealthUseCase = (*staticHealthReader)(nil)

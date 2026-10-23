@@ -14,29 +14,48 @@ import (
 
 	"server/internal/config"
 	"server/internal/health/application"
+	postgresstorage "server/internal/health/infrastructure/storage/postgres"
 	httptransport "server/internal/health/infrastructure/transport/http"
 )
 
-// main loads the application configuration, wires dependencies, and serves HTTP.
+// main es el Composition Root (punto de ensamblaje) de nuestra Arquitectura Hexagonal:
+//  1. Carga la configuración de entorno (PORT, GIN_MODE, DATABASE_URL).
+//  2. Inicializa el Adaptador Secundario (pool pgx hacia PostgreSQL 17) y verifica la conexión.
+//  3. Inyecta el repositorio en la Capa de Aplicación (HealthUseCase).
+//  4. Conecta el Caso de Uso al Adaptador Primario (Router HTTP Gin) y levanta el servidor.
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("no se pudo cargar la configuración: %v", err)
 	}
 
+	// NotifyContext convierte las señales del SO (Ctrl+C / SIGTERM) en cancelación de contexto
+	// para permitir un apagado ordenado (graceful shutdown) tanto de HTTP como de PostgreSQL.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	// Apply the configured mode before creating the Gin engine.
 	gin.SetMode(cfg.GinMode)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	healthUseCase := application.NewHealthUseCase(logger)
+
+	// Inicializamos el pool de conexiones a PostgreSQL (infrastructure/storage/postgres)
+	// y verificamos inmediatamente la conectividad contra localhost:5432.
+	dbPool, err := postgresstorage.NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("no se pudo conectar a PostgreSQL: %v", err)
+	}
+	defer dbPool.Close()
+	logger.InfoContext(ctx, "conexión a PostgreSQL establecida correctamente")
+
+	// Inyección de dependencias siguiendo la regla: Infrastructure -> Application -> Domain.
+	healthRepo := postgresstorage.NewRepository(dbPool)
+	healthUseCase := application.NewHealthUseCase(logger, healthRepo)
+
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           httptransport.NewRouter(logger, healthUseCase),
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 	}
-
-	// NotifyContext converts OS termination signals into a cancellation signal for graceful shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	serverErrors := make(chan error, 1)
 	go func() {

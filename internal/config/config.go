@@ -4,13 +4,20 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// DefaultDatabaseURL es la cadena de conexión de desarrollo local definida en
+// docker-compose.yml y docs/06_devops_despliegue.md. Se aplica cuando la
+// variable de entorno DATABASE_URL no está configurada explícitamente.
+const DefaultDatabaseURL = "postgres://game_user:local_dev_only_change_me@localhost:5432/prediction_fps?sslmode=disable"
 
 // Config contains the environment-driven settings used to start the API.
 type Config struct {
 	Port              string
 	GinMode           string
+	DatabaseURL       string
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
 }
@@ -36,6 +43,15 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("GIN_MODE debe ser debug, release o test")
 	}
 
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		// Usa las credenciales del contenedor Docker local por defecto para facilitar el arranque.
+		databaseURL = DefaultDatabaseURL
+	}
+	if !strings.HasPrefix(databaseURL, "postgres://") && !strings.HasPrefix(databaseURL, "postgresql://") {
+		return Config{}, fmt.Errorf("DATABASE_URL debe comenzar con postgres:// o postgresql://")
+	}
+
 	// Bound header reads and graceful shutdown by default; both limits can be tuned through the environment.
 	readHeaderTimeout, err := durationFromEnv("READ_HEADER_TIMEOUT", 5*time.Second)
 	if err != nil {
@@ -49,6 +65,7 @@ func Load() (Config, error) {
 	return Config{
 		Port:              port,
 		GinMode:           mode,
+		DatabaseURL:       databaseURL,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ShutdownTimeout:   shutdownTimeout,
 	}, nil

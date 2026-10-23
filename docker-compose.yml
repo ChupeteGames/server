@@ -1,0 +1,48 @@
+# ==============================================================================
+# Docker Compose — Infraestructura Local para el Servidor Backend (Go)
+# ==============================================================================
+# Propósito:
+#   Levantar PostgreSQL 17 en localhost:5432 y aplicar automáticamente las
+#   migraciones iniciales ubicadas en ./migrations (incluyendo 001_init.sql).
+#
+# Cómo usarlo desde la carpeta server/:
+#   1. Levantar en segundo plano:
+#      docker compose up -d
+#   2. Verificar estado saludable (healthy):
+#      docker compose ps
+#   3. Reiniciar desde cero (borrando volumen de datos para re-ejecutar init):
+#      docker compose down -v && docker compose up -d
+# ==============================================================================
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: prediction-fps-postgres
+    restart: unless-stopped
+    environment:
+      # Credenciales de desarrollo local alineadas con docs/06_devops_despliegue.md
+      POSTGRES_DB: prediction_fps
+      POSTGRES_USER: game_user
+      POSTGRES_PASSWORD: local_dev_only_change_me
+    ports:
+      # Expone PostgreSQL únicamente en la interfaz loopback local (127.0.0.1:5432)
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Persistencia de los datos entre reinicios del contenedor
+      - prediction_fps_pgdata:/var/lib/postgresql/data
+      # ------------------------------------------------------------------------
+      # Auto-aplicación de migraciones (Criterio de Aceptación MVP-002):
+      # La imagen oficial de postgres ejecuta en orden alfabético todos los
+      # archivos .sql montados en /docker-entrypoint-initdb.d/ cuando el
+      # directorio de datos se inicializa por primera vez.
+      # ------------------------------------------------------------------------
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Verifica periódicamente que el motor acepte conexiones en la BD del juego
+      test: ["CMD-SHELL", "pg_isready -U game_user -d prediction_fps"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  prediction_fps_pgdata:
