@@ -14,17 +14,28 @@ import (
 	"github.com/gin-gonic/gin"
 	"google.golang.org/grpc"
 
+	authapp "server/internal/auth/application"
+	"server/internal/auth/infrastructure/security"
+	authpostgres "server/internal/auth/infrastructure/storage/postgres"
+	authhttp "server/internal/auth/infrastructure/transport/http"
+	authhandlers "server/internal/auth/infrastructure/transport/http/handlers"
 	"server/internal/config"
-	"server/internal/health/application"
-	postgresstorage "server/internal/health/infrastructure/storage/postgres"
-	httptransport "server/internal/health/infrastructure/transport/http"
+	healthapp "server/internal/health/application"
+	healthpostgres "server/internal/health/infrastructure/storage/postgres"
+	healthhttp "server/internal/health/infrastructure/transport/http"
+	playersapp "server/internal/players/application"
+	playerspostgres "server/internal/players/infrastructure/storage/postgres"
+	playershttp "server/internal/players/infrastructure/transport/http"
 	grpctransport "server/internal/shared/transport/grpc"
 )
 
 // main es el Composition Root (punto de ensamblaje) de nuestra Arquitectura Hexagonal:
-//  1. Carga la configuración de entorno (PORT, GRPC_PORT, GIN_MODE, DATABASE_URL).
+//  1. Carga la configuración de entorno (PORT, GRPC_PORT, GIN_MODE, DATABASE_URL, JWT_SECRET).
 //  2. Inicializa el Adaptador Secundario (pool pgx hacia PostgreSQL 17) y verifica la conexión.
-//  3. Inyecta el repositorio en la Capa de Aplicación (HealthUseCase).
+//  3. Ensambla los repositorios, servicios de seguridad (bcrypt + JWT) y casos de uso de:
+//     - Health (`GET /health`)
+//     - Auth (`POST /v1/auth/login`)
+//     - Players (`GET /v1/players/me`)
 //  4. Levanta en paralelo los dos Adaptadores Primarios de entrada:
 //     - Servidor HTTP (Gin) en :8080 (para Clientes de Unreal Engine).
 //     - Servidor gRPC en :9090 (para el Unreal Dedicated Server).
@@ -45,25 +56,46 @@ func main() {
 
 	// Inicializamos el pool de conexiones a PostgreSQL (infrastructure/storage/postgres)
 	// y verificamos inmediatamente la conectividad contra localhost:5432.
-	dbPool, err := postgresstorage.NewPool(ctx, cfg.DatabaseURL)
+	dbPool, err := healthpostgres.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("no se pudo conectar a PostgreSQL: %v", err)
 	}
 	defer dbPool.Close()
 	logger.InfoContext(ctx, "conexión a PostgreSQL establecida correctamente")
 
-	// Inyección de dependencias siguiendo la regla: Infrastructure -> Application -> Domain.
-	healthRepo := postgresstorage.NewRepository(dbPool)
-	healthUseCase := application.NewHealthUseCase(logger, healthRepo)
+	// -------------------------------------------------------------------------
+	// Ensamblaje de Dependencias (Infrastructure -> Application -> Domain)
+	// -------------------------------------------------------------------------
 
-	// 1. Configuración del Adaptador Primario HTTP (Gin) para clientes Unreal.
+	// 1. Contexto: Health
+	healthRepo := healthpostgres.NewRepository(dbPool)
+	healthUseCase := healthapp.NewHealthUseCase(logger, healthRepo)
+
+	// 2. Contexto: Auth (Login/Registro transaccional + Bcrypt + JWT HS256)
+	userRepo := authpostgres.NewUserRepository(dbPool)
+	passwordHasher := security.NewBcryptHasher()
+	jwtManager := security.NewJWTManager(cfg.JWTSecret)
+	loginUseCase := authapp.NewLoginUseCase(logger, userRepo, passwordHasher, jwtManager)
+
+	// 3. Contexto: Players (Perfil competitivo, MMR, billetera y loadout)
+	playerRepo := playerspostgres.NewPlayerRepository(dbPool)
+	getMyProfileUseCase := playersapp.NewGetMyProfileUseCase(logger, playerRepo)
+
+	// -------------------------------------------------------------------------
+	// Registro de Rutas en el Adaptador Primario HTTP (Gin)
+	// -------------------------------------------------------------------------
+	router := healthhttp.NewRouter(logger, healthUseCase)
+	authhttp.RegisterRoutes(router, logger, loginUseCase)
+	bearerMiddleware := authhandlers.BearerAuthMiddleware(logger, jwtManager)
+	playershttp.RegisterRoutes(router, logger, bearerMiddleware, getMyProfileUseCase)
+
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           httptransport.NewRouter(logger, healthUseCase),
+		Handler:           router,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
 	}
 
-	// 2. Configuración del Adaptador Primario gRPC para el Unreal Dedicated Server.
+	// Configuración del Adaptador Primario gRPC para el Unreal Dedicated Server.
 	grpcListener, err := net.Listen("tcp", ":"+cfg.GRPCPort)
 	if err != nil {
 		log.Fatalf("no se pudo abrir el puerto gRPC :%s: %v", cfg.GRPCPort, err)
@@ -96,7 +128,6 @@ func main() {
 		shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 
-		// Detenemos el servidor gRPC de forma ordenada (esperando RPCs en curso o forzando al vencer el timeout).
 		stopped := make(chan struct{})
 		go func() {
 			grpcServer.GracefulStop()

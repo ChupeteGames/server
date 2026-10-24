@@ -10,6 +10,7 @@ func TestLoadUsesDefaults(t *testing.T) {
 	t.Setenv("GRPC_PORT", "")
 	t.Setenv("GIN_MODE", "")
 	t.Setenv("DATABASE_URL", "")
+	t.Setenv("JWT_SECRET", "")
 	t.Setenv("READ_HEADER_TIMEOUT", "")
 	t.Setenv("SHUTDOWN_TIMEOUT", "")
 
@@ -28,6 +29,9 @@ func TestLoadUsesDefaults(t *testing.T) {
 	}
 	if cfg.DatabaseURL != DefaultDatabaseURL {
 		t.Errorf("expected default database URL %q, got %q", DefaultDatabaseURL, cfg.DatabaseURL)
+	}
+	if cfg.JWTSecret != DefaultJWTSecret {
+		t.Errorf("expected default JWT secret %q, got %q", DefaultJWTSecret, cfg.JWTSecret)
 	}
 	if cfg.ReadHeaderTimeout != 5*time.Second || cfg.ShutdownTimeout != 5*time.Second {
 		t.Errorf("expected 5s timeout defaults, got read-header=%s shutdown=%s", cfg.ReadHeaderTimeout, cfg.ShutdownTimeout)
@@ -64,5 +68,13 @@ func TestLoadRejectsInvalidDatabaseURL(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for an invalid DATABASE_URL scheme")
+	}
+}
+
+func TestLoadRejectsShortJWTSecret(t *testing.T) {
+	t.Setenv("JWT_SECRET", "short")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for a JWT_SECRET shorter than 16 characters")
 	}
 }

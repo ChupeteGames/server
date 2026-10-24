@@ -34,13 +34,15 @@ flowchart LR
         end
 
         subgraph InfraOut["Infraestructura: Adaptadores Secundarios (Salida)"]
-            PGAdapter["Repositorio PostgreSQL<br/>(pgxpool v5)"]
+            PGAdapter["Repositorios PostgreSQL<br/>(pgxpool v5)"]
+            SecAdapter["Seguridad (Bcrypt + JWT HS256)"]
         end
 
         HTTP --> UC
         GRPC --> UC
         UC --> Entities
         PGAdapter -. "Implementa Puerto" .-> Entities
+        SecAdapter -. "Implementa Puerto" .-> Entities
     end
 
     DB[("PostgreSQL 17<br/>localhost:5432<br/>(10 tablas + catálogo)")]
@@ -98,13 +100,26 @@ server/
 │   └── proto/
 │       └── game_backend.proto       # Contrato Protobuf oficial (Unreal Dedicated Server <-> Go)
 ├── internal/
-│   ├── config/                      # Lectura y validación de variables de entorno (PORT, GRPC_PORT, DATABASE_URL, etc.)
+│   ├── auth/                        # Bounded Context: Autenticación, registro transaccional y JWT (POST /v1/auth/login)
+│   │   ├── domain/                  # Go puro: User, AuthSession, puertos (UserRepository, PasswordHasher, TokenManager)
+│   │   ├── application/             # Caso de Uso: LoginUseCase
+│   │   └── infrastructure/
+│   │       ├── security/            # Adaptadores Secundarios: BcryptHasher y JWTManager (HS256)
+│   │       ├── storage/postgres/    # Adaptador Secundario: Crea usuario + perfil (MMR 1000) + billetera + cosméticos base en 1 TX
+│   │       └── transport/http/      # Adaptador Primario: AuthHandler y BearerAuthMiddleware
+│   ├── config/                      # Lectura y validación de variables de entorno (PORT, GRPC_PORT, DATABASE_URL, JWT_SECRET)
 │   ├── health/                      # Bounded Context: Chequeo de salud del servicio y la BD
 │   │   ├── domain/                  # Go puro: Entidad Health, interfaz Pinger (Puerto) y errores tipados (errores.go)
 │   │   ├── application/             # Caso de Uso: HealthUseCase (ejecuta Ping contra los puertos registrados)
 │   │   └── infrastructure/
 │   │       ├── storage/postgres/    # Adaptador Secundario: Pool pgxpool y repositorio que implementa domain.Pinger
 │   │       └── transport/http/      # Adaptador Primario: Router Gin, middleware X-Trace-ID y HealthHandler
+│   ├── players/                     # Bounded Context: Perfil del jugador, MMR, billetera y loadout (GET /v1/players/me)
+│   │   ├── domain/                  # Go puro: PlayerProfile, CareerStats y puerto PlayerRepository
+│   │   ├── application/             # Caso de Uso: GetMyProfileUseCase
+│   │   └── infrastructure/
+│   │       ├── storage/postgres/    # Adaptador Secundario: Consulta unificada de perfil, billetera e inventario
+│   │       └── transport/http/      # Adaptador Primario: PlayerHandler y ruta protegida con Bearer JWT
 │   └── shared/
 │       ├── pb/gamev1/               # Código Go generado (.pb.go) desde game_backend.proto (DTOs de transporte gRPC)
 │       └── transport/grpc/          # Servidor gRPC (:9090), interceptor de trace_id, Health gRPC y Server Reflection
@@ -119,7 +134,7 @@ server/
 └── docker-compose.yml               # Orquestación local de PostgreSQL 17
 ```
 
-### Reglas clave para agregar nuevos módulos (ej. `auth`, `players`, `matchmaking`, `economy`)
+### Reglas clave para agregar nuevos módulos (ej. `matchmaking`, `matches`, `economy`)
 1. **`domain/` (100% Go puro):** Prohibido importar Gin, gRPC o `pgx`. Contiene entidades, lógica de negocio, puertos (interfaces de repositorios) y errores en `domain/errores.go`.
 2. **`application/` (Casos de Uso):** Solo importa `domain/` y `kit/logging`. Recibe repositorios por inyección de dependencias en su constructor `New...UseCase(...)`. Todo método `Execute` recibe `(ctx context.Context, traceID string, ...)`.
 3. **`infrastructure/` (Adaptadores):**
@@ -138,6 +153,7 @@ Todas las variables tienen valores por defecto listos para usar en desarrollo lo
 | `GRPC_PORT` | `9090` | Puerto del servidor gRPC para el Unreal Dedicated Server. |
 | `GIN_MODE` | `release` | Modo de Gin (`debug`, `release` o `test`). |
 | `DATABASE_URL` | `postgres://game_user:local_dev_only_change_me@localhost:5432/prediction_fps?sslmode=disable` | Cadena de conexión a PostgreSQL 17. |
+| `JWT_SECRET` | `local_dev_jwt_secret_change_me_in_production_32b` | Clave secreta (mín. 16 caracteres) para firmar tokens JWT HS256. |
 | `READ_HEADER_TIMEOUT` | `5s` | Tiempo máximo para leer headers HTTP. |
 | `SHUTDOWN_TIMEOUT` | `5s` | Tiempo máximo de espera para *graceful shutdown* (HTTP y gRPC). |
 
@@ -146,13 +162,25 @@ Todas las variables tienen valores por defecto listos para usar en desarrollo lo
 ## 5. Cómo Probar los Servicios Localmente
 
 ### A. Probar la API HTTP (`:8080`)
-Con el servidor corriendo, ejecutá desde PowerShell o abrí en el navegador:
+Con el servidor corriendo, ejecutá desde PowerShell:
 
+**1. Chequeo de salud (`GET /health`):**
 ```powershell
 Invoke-RestMethod -Uri "http://localhost:8080/health" -Method Get -Headers @{"X-Trace-ID"="mi-traza-123"}
 ```
 - **Respuesta (`200 OK`):** `{"status":"ok"}` (verifica en tiempo real mediante `pgxpool.Ping` que PostgreSQL esté respondiendo).
-- **Si PostgreSQL está apagado (`503 Service Unavailable`):** `{"status":"error"}`.
+
+**2. Iniciar sesión / Crear cuenta inicial (`POST /v1/auth/login`):**
+```powershell
+$login = Invoke-RestMethod -Uri "http://localhost:8080/v1/auth/login" -Method Post -ContentType "application/json" -Body '{"username":"jugador1","password":"password123"}'
+$login
+```
+- Si el usuario no existe, crea en una transacción ACID su cuenta (`users`), perfil inicial (`MMR = 1000`, `level = 1`), billetera (`balance = 0`) y cosméticos base (`bean_default`, `gore_classic`), devolviendo `access_token` (JWT), `player_id` y `display_name`.
+
+**3. Consultar mi perfil (`GET /v1/players/me`):**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/v1/players/me" -Method Get -Headers @{"Authorization"="Bearer $($login.access_token)"}
+```
 
 ### B. Probar el Servidor gRPC (`:9090`) con Postman / Insomnia
 El servidor gRPC tiene **Server Reflection** habilitado, por lo que no necesitás cargar el archivo `.proto` manualmente:

@@ -13,12 +13,17 @@ import (
 // variable de entorno DATABASE_URL no está configurada explícitamente.
 const DefaultDatabaseURL = "postgres://game_user:local_dev_only_change_me@localhost:5432/prediction_fps?sslmode=disable"
 
+// DefaultJWTSecret es la clave de firma HMAC-SHA256 por defecto para desarrollo local.
+// En entornos productivos debe sobrescribirse mediante la variable de entorno JWT_SECRET.
+const DefaultJWTSecret = "local_dev_jwt_secret_change_me_in_production_32b"
+
 // Config contains the environment-driven settings used to start the API (HTTP + gRPC).
 type Config struct {
 	Port              string
 	GRPCPort          string
 	GinMode           string
 	DatabaseURL       string
+	JWTSecret         string
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
 }
@@ -65,6 +70,14 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("DATABASE_URL debe comenzar con postgres:// o postgresql://")
 	}
 
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = DefaultJWTSecret
+	}
+	if len(jwtSecret) < 16 {
+		return Config{}, fmt.Errorf("JWT_SECRET debe tener al menos 16 caracteres")
+	}
+
 	// Bound header reads and graceful shutdown by default; both limits can be tuned through the environment.
 	readHeaderTimeout, err := durationFromEnv("READ_HEADER_TIMEOUT", 5*time.Second)
 	if err != nil {
@@ -80,6 +93,7 @@ func Load() (Config, error) {
 		GRPCPort:          grpcPort,
 		GinMode:           mode,
 		DatabaseURL:       databaseURL,
+		JWTSecret:         jwtSecret,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ShutdownTimeout:   shutdownTimeout,
 	}, nil
