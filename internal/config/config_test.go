@@ -7,6 +7,7 @@ import (
 
 func TestLoadUsesDefaults(t *testing.T) {
 	t.Setenv("PORT", "")
+	t.Setenv("GRPC_PORT", "")
 	t.Setenv("GIN_MODE", "")
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("READ_HEADER_TIMEOUT", "")
@@ -18,6 +19,9 @@ func TestLoadUsesDefaults(t *testing.T) {
 	}
 	if cfg.Port != "8080" {
 		t.Errorf("expected default port 8080, got %q", cfg.Port)
+	}
+	if cfg.GRPCPort != "9090" {
+		t.Errorf("expected default gRPC port 9090, got %q", cfg.GRPCPort)
 	}
 	if cfg.GinMode != "release" {
 		t.Errorf("expected default Gin mode release, got %q", cfg.GinMode)
@@ -35,6 +39,23 @@ func TestLoadRejectsInvalidPort(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for an out-of-range port")
+	}
+}
+
+func TestLoadRejectsInvalidGRPCPort(t *testing.T) {
+	t.Setenv("GRPC_PORT", "invalid")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for an invalid GRPC_PORT")
+	}
+}
+
+func TestLoadRejectsCollidingPorts(t *testing.T) {
+	t.Setenv("PORT", "8080")
+	t.Setenv("GRPC_PORT", "8080")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error when PORT and GRPC_PORT are identical")
 	}
 }
 
