@@ -13,9 +13,10 @@ import (
 // variable de entorno DATABASE_URL no está configurada explícitamente.
 const DefaultDatabaseURL = "postgres://game_user:local_dev_only_change_me@localhost:5432/prediction_fps?sslmode=disable"
 
-// Config contains the environment-driven settings used to start the API.
+// Config contains the environment-driven settings used to start the API (HTTP + gRPC).
 type Config struct {
 	Port              string
+	GRPCPort          string
 	GinMode           string
 	DatabaseURL       string
 	ReadHeaderTimeout time.Duration
@@ -31,6 +32,18 @@ func Load() (Config, error) {
 	}
 	if number, err := strconv.Atoi(port); err != nil || number < 1 || number > 65535 {
 		return Config{}, fmt.Errorf("PORT debe ser un número entre 1 y 65535")
+	}
+
+	grpcPort := os.Getenv("GRPC_PORT")
+	if grpcPort == "" {
+		// Puerto por defecto para el servidor gRPC que consume el Unreal Dedicated Server (docs/06).
+		grpcPort = "9090"
+	}
+	if number, err := strconv.Atoi(grpcPort); err != nil || number < 1 || number > 65535 {
+		return Config{}, fmt.Errorf("GRPC_PORT debe ser un número entre 1 y 65535")
+	}
+	if grpcPort == port {
+		return Config{}, fmt.Errorf("GRPC_PORT y PORT no pueden usar el mismo puerto (%s)", port)
 	}
 
 	mode := os.Getenv("GIN_MODE")
@@ -64,6 +77,7 @@ func Load() (Config, error) {
 
 	return Config{
 		Port:              port,
+		GRPCPort:          grpcPort,
 		GinMode:           mode,
 		DatabaseURL:       databaseURL,
 		ReadHeaderTimeout: readHeaderTimeout,

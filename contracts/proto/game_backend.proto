@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package game.v1;
+
+option go_package = "server/internal/shared/pb/gamev1;gamev1";
+
+// Servicio interno entre el Unreal Dedicated Server y el Backend Go (server/).
+// Este servicio NO se expone a internet; solo lo consume el servidor dedicado de Unreal.
+service GameBackendService {
+  // 1. Cuando un cliente intenta entrar al servidor de Unreal, Unreal valida su ticket con Go
+  // y recibe su equipo asignado (Team A o Team B) y los cosméticos que lleva puestos.
+  rpc ValidateJoinTicket(ValidateJoinTicketRequest) returns (ValidateJoinTicketResponse);
+
+  // 2. Cuando todos los jugadores entraron y arranca la Ronda 1, Unreal avisa que la partida está en curso.
+  rpc MarkMatchStarted(MarkMatchStartedRequest) returns (OperationResult);
+
+  // 3. Al terminar la partida (por victoria o empate), Unreal envía el acta final de la partida
+  // y de cada ronda para que Go actualice MMR, monedas, XP y estadísticas de forma idempotente.
+  rpc ReportMatchResult(ReportMatchResultRequest) returns (ReportMatchResultResponse);
+}
+
+enum TeamSide {
+  TEAM_SIDE_UNSPECIFIED = 0;
+  TEAM_SIDE_A = 1;
+  TEAM_SIDE_B = 2;
+}
+
+enum MatchOutcome {
+  MATCH_OUTCOME_UNSPECIFIED = 0;
+  MATCH_OUTCOME_TEAM_A_WIN = 1;
+  MATCH_OUTCOME_TEAM_B_WIN = 2;
+  MATCH_OUTCOME_DRAW_MUTUAL_ELIMINATION = 3; // Últimos vivos se matan mutuamente en la misma revelación
+  MATCH_OUTCOME_DRAW_STALEMATE_TIMER = 4;    // El reloj de 3 minutos llegó a 0 tras 4 rondas sin muertes
+}
+
+message ValidateJoinTicketRequest {
+  string trace_id = 1;
+  string match_id = 2;
+  string join_ticket = 3;
+}
+
+message ValidateJoinTicketResponse {
+  bool valid = 1;
+  string reason_code = 2;               // Ej. "OK", "TICKET_EXPIRED", "TICKET_ALREADY_USED"
+  string player_id = 3;
+  string display_name = 4;
+  TeamSide assigned_team = 5;
+  string equipped_skin_code = 6;        // Skin estilo Fall Guys para replicar a los demás clientes
+  string equipped_death_effect_code = 7;// Efecto de explosión sangrienta al morir
+  int32 current_mmr = 8;
+}
+
+message MarkMatchStartedRequest {
+  string trace_id = 1;
+  string match_id = 2;
+  string server_instance_id = 3;
+}
+
+message RoundSummary {
+  int32 round_number = 1;
+  int32 kills_in_round = 2;
+  int32 grace_rounds_consumed = 3;      // Jugadores que gastaron su Ronda de Gracia en esta ronda (<70% expuestos o no dispararon)
+  int32 grace_penalty_deaths = 4;       // Jugadores que explotaron por incumplir sin tener Ronda de Gracia disponible
+  bool stalemate_timer_active = 5;      // Si estuvo corriendo el contador de 3 minutos
+  bool triggered_duel_1v1 = 6;          // Si esta ronda desembocó en el Duelo 1v1 obligatorio
+}
+
+message PlayerMatchStats {
+  string player_id = 1;
+  TeamSide team = 2;
+  int32 kills = 3;
+  int32 deaths = 4;
+  int32 mutual_kills = 5;               // Veces que mató y murió en la misma revelación
+  int32 shots_fired = 6;
+  int32 valid_wall_shots = 7;           // Disparos bien apuntados hacia la Pared central
+  int32 wasted_shots = 8;               // Disparos hacia otras paredes o aliados
+  bool grace_round_used = 9;            // Si usó su única Ronda de Gracia en la partida
+  bool died_by_grace_penalty = 10;      // Si murió automáticamente por agotamiento de Ronda de Gracia
+  bool won_1v1_duel = 11;               // Si ganó un Duelo 1v1 en tiempo real al final de la partida
+}
+
+message ReportMatchResultRequest {
+  string trace_id = 1;
+  string operation_id = 2;              // UUID de idempotencia: si Unreal reintenta con el mismo ID, Go no duplica premios
+  string match_id = 3;
+  MatchOutcome outcome = 4;
+  int32 total_rounds = 5;
+  bool ended_in_duel = 6;
+  int32 duration_seconds = 7;
+  repeated RoundSummary rounds = 8;
+  repeated PlayerMatchStats player_stats = 9;
+}
+
+message PlayerRewardSummary {
+  string player_id = 1;
+  int32 mmr_delta = 2;
+  int32 new_mmr = 3;
+  int64 coins_earned = 4;
+  int64 new_wallet_balance = 5;
+  int64 xp_earned = 6;
+  int32 new_level = 7;
+}
+
+message ReportMatchResultResponse {
+  bool success = 1;
+  string operation_id = 2;
+  string result_code = 3;               // "PROCESSED" o "ALREADY_PROCESSED" (idempotencia)
+  repeated PlayerRewardSummary rewards = 4;
+}
+
+message OperationResult {
+  bool success = 1;
+  string result_code = 2;
+  string message = 3;
+}
