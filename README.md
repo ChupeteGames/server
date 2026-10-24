@@ -211,6 +211,17 @@ Invoke-RestMethod -Uri "http://localhost:8080/v1/matchmaking/status" -Method Get
 Invoke-RestMethod -Uri "http://localhost:8080/v1/matchmaking/dequeue" -Method Delete -Headers @{"Authorization"="Bearer $($login.access_token)"}
 ```
 
+**7. Validar ticket desde Unreal Dedicated Server vía HTTP interno (`POST /v1/internal/matches/validate-ticket`):**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/v1/internal/matches/validate-ticket" -Method Post -ContentType "application/json" -Body "{`"trace_id`":`"unreal-ds-1`",`"match_id`":`"$($queue.match_id)`",`"join_ticket`":`"$($queue.join_ticket)`"}"
+```
+- Expone por HTTP/JSON el mismo caso de uso que `ValidateJoinTicket` de gRPC (según el *Plan B / Spike técnico* de `docs/03` y `docs/07`) para que el `UBackendSubsystem` de Unreal Engine 5.7 pueda invocarlo directamente con el módulo `HTTP` nativo del motor.
+
+**8. Notificar inicio de partida desde Unreal Dedicated Server (`POST /v1/internal/matches/mark-started`):**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/v1/internal/matches/mark-started" -Method Post -ContentType "application/json" -Body "{`"trace_id`":`"unreal-ds-2`",`"match_id`":`"$($queue.match_id)`",`"server_instance_id`":`"unreal-ds-local`"}"
+```
+
 ### B. Probar el Servidor gRPC (`:9090`) con Postman / Insomnia
 El servidor gRPC tiene **Server Reflection** habilitado, por lo que no necesitás cargar el archivo `.proto` manualmente:
 1. Abrí **Postman** ➔ **New** ➔ **gRPC**.
