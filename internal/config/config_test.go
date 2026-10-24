@@ -11,6 +11,8 @@ func TestLoadUsesDefaults(t *testing.T) {
 	t.Setenv("GIN_MODE", "")
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("JWT_SECRET", "")
+	t.Setenv("DEDICATED_SERVER_HOST", "")
+	t.Setenv("DEDICATED_SERVER_PORT", "")
 	t.Setenv("READ_HEADER_TIMEOUT", "")
 	t.Setenv("SHUTDOWN_TIMEOUT", "")
 
@@ -32,6 +34,12 @@ func TestLoadUsesDefaults(t *testing.T) {
 	}
 	if cfg.JWTSecret != DefaultJWTSecret {
 		t.Errorf("expected default JWT secret %q, got %q", DefaultJWTSecret, cfg.JWTSecret)
+	}
+	if cfg.DedicatedServerHost != DefaultDedicatedServerHost {
+		t.Errorf("expected default server host %q, got %q", DefaultDedicatedServerHost, cfg.DedicatedServerHost)
+	}
+	if cfg.DedicatedServerPort != DefaultDedicatedServerPort {
+		t.Errorf("expected default server port %d, got %d", DefaultDedicatedServerPort, cfg.DedicatedServerPort)
 	}
 	if cfg.ReadHeaderTimeout != 5*time.Second || cfg.ShutdownTimeout != 5*time.Second {
 		t.Errorf("expected 5s timeout defaults, got read-header=%s shutdown=%s", cfg.ReadHeaderTimeout, cfg.ShutdownTimeout)
@@ -76,5 +84,13 @@ func TestLoadRejectsShortJWTSecret(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for a JWT_SECRET shorter than 16 characters")
+	}
+}
+
+func TestLoadRejectsInvalidDedicatedServerPort(t *testing.T) {
+	t.Setenv("DEDICATED_SERVER_PORT", "99999")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for an invalid DEDICATED_SERVER_PORT")
 	}
 }

@@ -36,6 +36,7 @@ flowchart LR
         subgraph InfraOut["Infraestructura: Adaptadores Secundarios (Salida)"]
             PGAdapter["Repositorios PostgreSQL<br/>(pgxpool v5)"]
             SecAdapter["Seguridad (Bcrypt + JWT HS256)"]
+            QueueAdapter["Cola Concurrente en Memoria"]
         end
 
         HTTP --> UC
@@ -43,6 +44,7 @@ flowchart LR
         UC --> Entities
         PGAdapter -. "Implementa Puerto" .-> Entities
         SecAdapter -. "Implementa Puerto" .-> Entities
+        QueueAdapter -. "Implementa Puerto" .-> Entities
     end
 
     DB[("PostgreSQL 17<br/>localhost:5432<br/>(10 tablas + catálogo)")]
@@ -107,13 +109,20 @@ server/
 │   │       ├── security/            # Adaptadores Secundarios: BcryptHasher y JWTManager (HS256)
 │   │       ├── storage/postgres/    # Adaptador Secundario: Crea usuario + perfil (MMR 1000) + billetera + cosméticos base en 1 TX
 │   │       └── transport/http/      # Adaptador Primario: AuthHandler y BearerAuthMiddleware
-│   ├── config/                      # Lectura y validación de variables de entorno (PORT, GRPC_PORT, DATABASE_URL, JWT_SECRET)
+│   ├── config/                      # Lectura y validación de variables de entorno (PORT, GRPC_PORT, DATABASE_URL, JWT_SECRET, etc.)
 │   ├── health/                      # Bounded Context: Chequeo de salud del servicio y la BD
 │   │   ├── domain/                  # Go puro: Entidad Health, interfaz Pinger (Puerto) y errores tipados (errores.go)
 │   │   ├── application/             # Caso de Uso: HealthUseCase (ejecuta Ping contra los puertos registrados)
 │   │   └── infrastructure/
 │   │       ├── storage/postgres/    # Adaptador Secundario: Pool pgxpool y repositorio que implementa domain.Pinger
 │   │       └── transport/http/      # Adaptador Primario: Router Gin, middleware X-Trace-ID y HealthHandler
+│   ├── matchmaking/                 # Bounded Context: Cola 2v2-5v5, armado de partidas y tickets (MVP-008)
+│   │   ├── domain/                  # Go puro: Match, MatchTicket, puertos (MatchRepository, MatchmakingQueue) y errores tipados
+│   │   ├── application/             # Casos de Uso: EnqueueUseCase, GetStatusUseCase, DequeueUseCase, ValidateJoinTicketUseCase, MarkMatchStartedUseCase
+│   │   └── infrastructure/
+│   │       ├── queue/memory/        # Adaptador Secundario: Cola en memoria thread-safe (FIFO con balanceo 2v2)
+│   │       ├── storage/postgres/    # Adaptador Secundario: Inserción transaccional de match + tickets y validación atómica
+│   │       └── transport/http/      # Adaptador Primario: MatchmakingHandler (endpoints /v1/matchmaking/...)
 │   ├── players/                     # Bounded Context: Perfil del jugador, MMR, billetera y loadout (GET /v1/players/me)
 │   │   ├── domain/                  # Go puro: PlayerProfile, CareerStats y puerto PlayerRepository
 │   │   ├── application/             # Caso de Uso: GetMyProfileUseCase
@@ -134,7 +143,7 @@ server/
 └── docker-compose.yml               # Orquestación local de PostgreSQL 17
 ```
 
-### Reglas clave para agregar nuevos módulos (ej. `matchmaking`, `matches`, `economy`)
+### Reglas clave para agregar nuevos módulos (ej. `matches`, `economy`)
 1. **`domain/` (100% Go puro):** Prohibido importar Gin, gRPC o `pgx`. Contiene entidades, lógica de negocio, puertos (interfaces de repositorios) y errores en `domain/errores.go`.
 2. **`application/` (Casos de Uso):** Solo importa `domain/` y `kit/logging`. Recibe repositorios por inyección de dependencias en su constructor `New...UseCase(...)`. Todo método `Execute` recibe `(ctx context.Context, traceID string, ...)`.
 3. **`infrastructure/` (Adaptadores):**
@@ -154,6 +163,8 @@ Todas las variables tienen valores por defecto listos para usar en desarrollo lo
 | `GIN_MODE` | `release` | Modo de Gin (`debug`, `release` o `test`). |
 | `DATABASE_URL` | `postgres://game_user:local_dev_only_change_me@localhost:5432/prediction_fps?sslmode=disable` | Cadena de conexión a PostgreSQL 17. |
 | `JWT_SECRET` | `local_dev_jwt_secret_change_me_in_production_32b` | Clave secreta (mín. 16 caracteres) para firmar tokens JWT HS256. |
+| `DEDICATED_SERVER_HOST` | `127.0.0.1` | Host o IP del Unreal Dedicated Server devuelto a los clientes emparejados. |
+| `DEDICATED_SERVER_PORT` | `7777` | Puerto del Unreal Dedicated Server devuelto a los clientes emparejados. |
 | `READ_HEADER_TIMEOUT` | `5s` | Tiempo máximo para leer headers HTTP. |
 | `SHUTDOWN_TIMEOUT` | `5s` | Tiempo máximo de espera para *graceful shutdown* (HTTP y gRPC). |
 
@@ -182,15 +193,33 @@ $login
 Invoke-RestMethod -Uri "http://localhost:8080/v1/players/me" -Method Get -Headers @{"Authorization"="Bearer $($login.access_token)"}
 ```
 
+**4. Encolarse en Matchmaking 2v2 (`POST /v1/matchmaking/enqueue`):**
+```powershell
+$queue = Invoke-RestMethod -Uri "http://localhost:8080/v1/matchmaking/enqueue" -Method Post -Headers @{"Authorization"="Bearer $($login.access_token)"} -ContentType "application/json" -Body '{"mode":"2v2"}'
+$queue
+```
+- Mientras haya menos de 4 jugadores: devuelve `{"status":"QUEUED","mode":"2v2"}`.
+- Al ingresar el 4to jugador: crea la partida en `matches`, divide 2 a `TEAM_A` y 2 a `TEAM_B`, genera un `join_ticket` temporal en `match_tickets` y devuelve `{"status":"MATCH_FOUND","match_id":"...","server_host":"127.0.0.1","server_port":7777,"join_ticket":"...","assigned_team":"TEAM_A","expires_at":"..."}`.
+
+**5. Consultar estado del emparejamiento (`GET /v1/matchmaking/status`):**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/v1/matchmaking/status" -Method Get -Headers @{"Authorization"="Bearer $($login.access_token)"}
+```
+
+**6. Cancelar búsqueda en cola (`DELETE /v1/matchmaking/dequeue`):**
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8080/v1/matchmaking/dequeue" -Method Delete -Headers @{"Authorization"="Bearer $($login.access_token)"}
+```
+
 ### B. Probar el Servidor gRPC (`:9090`) con Postman / Insomnia
 El servidor gRPC tiene **Server Reflection** habilitado, por lo que no necesitás cargar el archivo `.proto` manualmente:
 1. Abrí **Postman** ➔ **New** ➔ **gRPC**.
 2. Ingresá la URL `localhost:9090`.
 3. Hacé clic en **Select a method** y elegí cualquiera de los métodos descubiertos automáticamente:
    - `grpc.health.v1.Health / Check` ➔ responde `"status": "SERVING"`.
-   - `game.v1.GameBackendService / ValidateJoinTicket`
-   - `game.v1.GameBackendService / MarkMatchStarted`
-   - `game.v1.GameBackendService / ReportMatchResult`
+   - `game.v1.GameBackendService / ValidateJoinTicket` ➔ valida tickets de acceso, unicidad de consumo, expiración y devuelve equipo asignado y cosméticos equipados.
+   - `game.v1.GameBackendService / MarkMatchStarted` ➔ actualiza la partida a `in_progress` al arrancar la Ronda 1.
+   - `game.v1.GameBackendService / ReportMatchResult` ➔ pendiente para MVP-015.
 4. Todos los métodos leen `trace_id` (desde el mensaje Protobuf o el metadata `x-trace-id`), lo registran en el log JSON estructurado de Go y lo devuelven en los headers de respuesta gRPC.
 
 ---
@@ -228,5 +257,5 @@ go test -v ./...
 ```
 
 ### Convenciones de Git del Equipo
-- **Ramas:** `feature/xxxx-xxx-xx` (en minúsculas y separadas por guiones, ej. `feature/grpc-server-proto`).
+- **Ramas:** `feature/xxxx-xxx-xx` (en minúsculas y separadas por guiones, ej. `feature/matchmaking-module`).
 - **Commits:** Una sola oración breve y clara que resuma el cambio realizado.

@@ -17,15 +17,24 @@ const DefaultDatabaseURL = "postgres://game_user:local_dev_only_change_me@localh
 // En entornos productivos debe sobrescribirse mediante la variable de entorno JWT_SECRET.
 const DefaultJWTSecret = "local_dev_jwt_secret_change_me_in_production_32b"
 
+// DefaultDedicatedServerHost y DefaultDedicatedServerPort son los datos por defecto
+// de la instancia de Unreal Dedicated Server según ADR-05.
+const (
+	DefaultDedicatedServerHost = "127.0.0.1"
+	DefaultDedicatedServerPort = 7777
+)
+
 // Config contains the environment-driven settings used to start the API (HTTP + gRPC).
 type Config struct {
-	Port              string
-	GRPCPort          string
-	GinMode           string
-	DatabaseURL       string
-	JWTSecret         string
-	ReadHeaderTimeout time.Duration
-	ShutdownTimeout   time.Duration
+	Port                string
+	GRPCPort            string
+	GinMode             string
+	DatabaseURL         string
+	JWTSecret           string
+	DedicatedServerHost string
+	DedicatedServerPort int
+	ReadHeaderTimeout   time.Duration
+	ShutdownTimeout     time.Duration
 }
 
 // Load reads environment settings and applies validated defaults for optional values.
@@ -78,6 +87,20 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("JWT_SECRET debe tener al menos 16 caracteres")
 	}
 
+	dedicatedServerHost := os.Getenv("DEDICATED_SERVER_HOST")
+	if dedicatedServerHost == "" {
+		dedicatedServerHost = DefaultDedicatedServerHost
+	}
+
+	dedicatedServerPort := DefaultDedicatedServerPort
+	if pStr := os.Getenv("DEDICATED_SERVER_PORT"); pStr != "" {
+		p, err := strconv.Atoi(pStr)
+		if err != nil || p < 1 || p > 65535 {
+			return Config{}, fmt.Errorf("DEDICATED_SERVER_PORT debe ser un número entre 1 y 65535")
+		}
+		dedicatedServerPort = p
+	}
+
 	// Bound header reads and graceful shutdown by default; both limits can be tuned through the environment.
 	readHeaderTimeout, err := durationFromEnv("READ_HEADER_TIMEOUT", 5*time.Second)
 	if err != nil {
@@ -89,13 +112,15 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		Port:              port,
-		GRPCPort:          grpcPort,
-		GinMode:           mode,
-		DatabaseURL:       databaseURL,
-		JWTSecret:         jwtSecret,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ShutdownTimeout:   shutdownTimeout,
+		Port:                port,
+		GRPCPort:            grpcPort,
+		GinMode:             mode,
+		DatabaseURL:         databaseURL,
+		JWTSecret:           jwtSecret,
+		DedicatedServerHost: dedicatedServerHost,
+		DedicatedServerPort: dedicatedServerPort,
+		ReadHeaderTimeout:   readHeaderTimeout,
+		ShutdownTimeout:     shutdownTimeout,
 	}, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
+	matchmakingdomain "server/internal/matchmaking/domain"
 	"server/internal/shared/pb/gamev1"
 	"server/kit/logging"
 )
@@ -41,33 +43,107 @@ func TraceIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-// GameBackendAdapter es el Adaptador Primario (Input Adapter) gRPC para GameBackendService.
-// En esta etapa (MVP-005), expone el contrato compilado y delega las llamadas a las
-// implementaciones de casos de uso que se conectarán en MVP-008 (Matchmaking) y MVP-015 (Matches).
-// Si un método se invoca antes de inyectar su caso de uso específico, responde con el código
-// estándar codes.Unimplemented de gRPC y registra el trace_id correspondiente.
-type GameBackendAdapter struct {
-	gamev1.UnimplementedGameBackendServiceServer
-	logger logging.Logger
+// ValidateTicketRunner define el puerto primario invocado por gRPC para validar tickets de ingreso.
+type ValidateTicketRunner interface {
+	Execute(ctx context.Context, traceID string, matchID string, ticketToken string) (matchmakingdomain.ValidatedTicket, error)
 }
 
-// NewGameBackendAdapter construye el adaptador gRPC de GameBackendService.
-func NewGameBackendAdapter(logger logging.Logger) *GameBackendAdapter {
-	return &GameBackendAdapter{logger: logger}
+// MarkMatchStartedRunner define el puerto primario invocado por gRPC para notificar inicio de partida.
+type MarkMatchStartedRunner interface {
+	Execute(ctx context.Context, traceID string, matchID string, serverInstanceID string) error
+}
+
+// GameBackendAdapter es el Adaptador Primario (Input Adapter) gRPC para GameBackendService.
+// Expone el contrato gRPC oficial consumido por el Unreal Dedicated Server y delega
+// en los casos de uso de aplicación correspondientes (Matchmaking en MVP-008, Matches en MVP-015).
+type GameBackendAdapter struct {
+	gamev1.UnimplementedGameBackendServiceServer
+	logger             logging.Logger
+	validateTicketUC   ValidateTicketRunner
+	markMatchStartedUC MarkMatchStartedRunner
+}
+
+// NewGameBackendAdapter construye el adaptador gRPC inyectando los casos de uso requeridos.
+func NewGameBackendAdapter(
+	logger logging.Logger,
+	validateTicketUC ValidateTicketRunner,
+	markMatchStartedUC MarkMatchStartedRunner,
+) *GameBackendAdapter {
+	return &GameBackendAdapter{
+		logger:             logger,
+		validateTicketUC:   validateTicketUC,
+		markMatchStartedUC: markMatchStartedUC,
+	}
 }
 
 // ValidateJoinTicket recibe la solicitud de validación de ticket desde el Unreal Dedicated Server (PreLogin/PostLogin).
 func (a *GameBackendAdapter) ValidateJoinTicket(ctx context.Context, req *gamev1.ValidateJoinTicketRequest) (*gamev1.ValidateJoinTicketResponse, error) {
 	traceID := resolveTraceID(ctx, req)
 	a.logger.InfoContext(ctx, "gRPC ValidateJoinTicket received", "trace_id", traceID, "match_id", req.GetMatchId())
-	return nil, status.Errorf(codes.Unimplemented, "ValidateJoinTicket aún no implementado (pendiente MVP-008)")
+
+	if a.validateTicketUC == nil {
+		return nil, status.Errorf(codes.Unimplemented, "ValidateJoinTicket aún no implementado (caso de uso no configurado)")
+	}
+
+	result, err := a.validateTicketUC.Execute(ctx, traceID, req.GetMatchId(), req.GetJoinTicket())
+	if err != nil {
+		a.logger.ErrorContext(ctx, "error interno en ValidateJoinTicket", "trace_id", traceID, "error", err)
+		return nil, status.Errorf(codes.Internal, "error interno validando ticket: %v", err)
+	}
+
+	var assignedTeam gamev1.TeamSide
+	switch result.AssignedTeam {
+	case matchmakingdomain.TeamSideA:
+		assignedTeam = gamev1.TeamSide_TEAM_SIDE_A
+	case matchmakingdomain.TeamSideB:
+		assignedTeam = gamev1.TeamSide_TEAM_SIDE_B
+	default:
+		assignedTeam = gamev1.TeamSide_TEAM_SIDE_UNSPECIFIED
+	}
+
+	return &gamev1.ValidateJoinTicketResponse{
+		Valid:                   result.Valid,
+		ReasonCode:              result.ReasonCode,
+		PlayerId:                result.PlayerID,
+		DisplayName:             result.DisplayName,
+		AssignedTeam:            assignedTeam,
+		EquippedSkinCode:        result.EquippedSkinCode,
+		EquippedDeathEffectCode: result.EquippedDeathEffectCode,
+		CurrentMmr:              int32(result.CurrentMMR),
+	}, nil
 }
 
 // MarkMatchStarted recibe el aviso de inicio de la Ronda 1 desde el Unreal Dedicated Server.
 func (a *GameBackendAdapter) MarkMatchStarted(ctx context.Context, req *gamev1.MarkMatchStartedRequest) (*gamev1.OperationResult, error) {
 	traceID := resolveTraceID(ctx, req)
 	a.logger.InfoContext(ctx, "gRPC MarkMatchStarted received", "trace_id", traceID, "match_id", req.GetMatchId())
-	return nil, status.Errorf(codes.Unimplemented, "MarkMatchStarted aún no implementado (pendiente MVP-008)")
+
+	if a.markMatchStartedUC == nil {
+		return nil, status.Errorf(codes.Unimplemented, "MarkMatchStarted aún no implementado (caso de uso no configurado)")
+	}
+
+	err := a.markMatchStartedUC.Execute(ctx, traceID, req.GetMatchId(), req.GetServerInstanceId())
+	if err != nil {
+		if errors.Is(err, matchmakingdomain.ErrMatchNotFound) {
+			return &gamev1.OperationResult{
+				Success:    false,
+				ResultCode: "MATCH_NOT_FOUND",
+				Message:    "la partida solicitada no existe",
+			}, nil
+		}
+		a.logger.ErrorContext(ctx, "error en MarkMatchStarted", "trace_id", traceID, "error", err)
+		return &gamev1.OperationResult{
+			Success:    false,
+			ResultCode: "ERROR",
+			Message:    err.Error(),
+		}, nil
+	}
+
+	return &gamev1.OperationResult{
+		Success:    true,
+		ResultCode: "MATCH_STARTED",
+		Message:    "partida iniciada correctamente en el servidor",
+	}, nil
 }
 
 // ReportMatchResult recibe el acta final de la partida desde el Unreal Dedicated Server.
@@ -89,7 +165,7 @@ func (a *GameBackendAdapter) ReportMatchResult(ctx context.Context, req *gamev1.
 //  3. El servicio GameBackendService generado desde contracts/proto/game_backend.proto.
 func NewServer(logger logging.Logger, backendService gamev1.GameBackendServiceServer) *grpc.Server {
 	if backendService == nil {
-		backendService = NewGameBackendAdapter(logger)
+		backendService = NewGameBackendAdapter(logger, nil, nil)
 	}
 
 	grpcServer := grpc.NewServer(
