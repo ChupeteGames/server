@@ -23,6 +23,10 @@ import (
 	healthapp "server/internal/health/application"
 	healthpostgres "server/internal/health/infrastructure/storage/postgres"
 	healthhttp "server/internal/health/infrastructure/transport/http"
+	matchmakingapp "server/internal/matchmaking/application"
+	memoryqueue "server/internal/matchmaking/infrastructure/queue/memory"
+	matchmakingpostgres "server/internal/matchmaking/infrastructure/storage/postgres"
+	matchmakinghttp "server/internal/matchmaking/infrastructure/transport/http"
 	playersapp "server/internal/players/application"
 	playerspostgres "server/internal/players/infrastructure/storage/postgres"
 	playershttp "server/internal/players/infrastructure/transport/http"
@@ -30,15 +34,16 @@ import (
 )
 
 // main es el Composition Root (punto de ensamblaje) de nuestra Arquitectura Hexagonal:
-//  1. Carga la configuración de entorno (PORT, GRPC_PORT, GIN_MODE, DATABASE_URL, JWT_SECRET).
+//  1. Carga la configuración de entorno (PORT, GRPC_PORT, GIN_MODE, DATABASE_URL, JWT_SECRET, DEDICATED_SERVER_HOST/PORT).
 //  2. Inicializa el Adaptador Secundario (pool pgx hacia PostgreSQL 17) y verifica la conexión.
-//  3. Ensambla los repositorios, servicios de seguridad (bcrypt + JWT) y casos de uso de:
+//  3. Ensambla los repositorios, servicios de seguridad (bcrypt + JWT), colas y casos de uso de:
 //     - Health (`GET /health`)
 //     - Auth (`POST /v1/auth/login`)
 //     - Players (`GET /v1/players/me`)
+//     - Matchmaking (`POST /v1/matchmaking/enqueue`, `GET /v1/matchmaking/status`, `DELETE /v1/matchmaking/dequeue`)
 //  4. Levanta en paralelo los dos Adaptadores Primarios de entrada:
 //     - Servidor HTTP (Gin) en :8080 (para Clientes de Unreal Engine).
-//     - Servidor gRPC en :9090 (para el Unreal Dedicated Server).
+//     - Servidor gRPC en :9090 (para el Unreal Dedicated Server, con ValidateJoinTicket y MarkMatchStarted conectados).
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -81,6 +86,21 @@ func main() {
 	playerRepo := playerspostgres.NewPlayerRepository(dbPool)
 	getMyProfileUseCase := playersapp.NewGetMyProfileUseCase(logger, playerRepo)
 
+	// 4. Contexto: Matchmaking (Cola 2v2 a 5v5, tickets de acceso y validación gRPC)
+	matchRepo := matchmakingpostgres.NewMatchRepository(dbPool)
+	matchQueue := memoryqueue.NewMemoryQueue()
+	enqueueUseCase := matchmakingapp.NewEnqueueUseCase(
+		logger,
+		matchRepo,
+		matchQueue,
+		cfg.DedicatedServerHost,
+		cfg.DedicatedServerPort,
+	)
+	getStatusUseCase := matchmakingapp.NewGetStatusUseCase(logger, matchRepo, matchQueue)
+	dequeueUseCase := matchmakingapp.NewDequeueUseCase(logger, matchQueue)
+	validateJoinTicketUseCase := matchmakingapp.NewValidateJoinTicketUseCase(logger, matchRepo)
+	markMatchStartedUseCase := matchmakingapp.NewMarkMatchStartedUseCase(logger, matchRepo)
+
 	// -------------------------------------------------------------------------
 	// Registro de Rutas en el Adaptador Primario HTTP (Gin)
 	// -------------------------------------------------------------------------
@@ -88,6 +108,14 @@ func main() {
 	authhttp.RegisterRoutes(router, logger, loginUseCase)
 	bearerMiddleware := authhandlers.BearerAuthMiddleware(logger, jwtManager)
 	playershttp.RegisterRoutes(router, logger, bearerMiddleware, getMyProfileUseCase)
+	matchmakinghttp.RegisterRoutes(
+		router,
+		logger,
+		bearerMiddleware,
+		enqueueUseCase,
+		getStatusUseCase,
+		dequeueUseCase,
+	)
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -100,7 +128,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("no se pudo abrir el puerto gRPC :%s: %v", cfg.GRPCPort, err)
 	}
-	grpcAdapter := grpctransport.NewGameBackendAdapter(logger)
+	grpcAdapter := grpctransport.NewGameBackendAdapter(
+		logger,
+		validateJoinTicketUseCase,
+		markMatchStartedUseCase,
+	)
 	grpcServer := grpctransport.NewServer(logger, grpcAdapter)
 
 	serverErrors := make(chan error, 2)
