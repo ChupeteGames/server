@@ -116,6 +116,12 @@ func main() {
 		getStatusUseCase,
 		dequeueUseCase,
 	)
+	matchmakinghttp.RegisterDedicatedServerRoutes(
+		router,
+		logger,
+		validateJoinTicketUseCase,
+		markMatchStartedUseCase,
+	)
 
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
