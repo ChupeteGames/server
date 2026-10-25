@@ -25,3 +25,18 @@ func RegisterRoutes(
 	router.GET("/v1/matchmaking/status", authMiddleware, handler.GetStatus)
 	router.DELETE("/v1/matchmaking/dequeue", authMiddleware, handler.DeleteDequeue)
 }
+
+// RegisterDedicatedServerRoutes registra los endpoints HTTP internos consumidos por el
+// Unreal Dedicated Server para validar tickets de ingreso y notificar el inicio de partida,
+// delegando en los mismos casos de uso que el servidor gRPC (Plan B / Spike de docs/03 y docs/07).
+func RegisterDedicatedServerRoutes(
+	router *gin.Engine,
+	logger logging.Logger,
+	validateTicketUC *application.ValidateJoinTicketUseCase,
+	markStartedUC *application.MarkMatchStartedUseCase,
+) {
+	dsHandler := handlers.NewDedicatedServerHandler(logger, validateTicketUC, markStartedUC)
+
+	router.POST("/v1/internal/matches/validate-ticket", dsHandler.PostValidateTicket)
+	router.POST("/v1/internal/matches/mark-started", dsHandler.PostMarkMatchStarted)
+}

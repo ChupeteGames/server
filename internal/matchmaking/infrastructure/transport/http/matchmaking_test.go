@@ -152,8 +152,11 @@ func setupTestRouter(
 	enqueueUC := matchmakingapp.NewEnqueueUseCase(logger, repo, queue, "127.0.0.1", 7777)
 	statusUC := matchmakingapp.NewGetStatusUseCase(logger, repo, queue)
 	dequeueUC := matchmakingapp.NewDequeueUseCase(logger, queue)
+	validateTicketUC := matchmakingapp.NewValidateJoinTicketUseCase(logger, repo)
+	markStartedUC := matchmakingapp.NewMarkMatchStartedUseCase(logger, repo)
 
 	matchmakinghttp.RegisterRoutes(router, logger, authMiddleware, enqueueUC, statusUC, dequeueUC)
+	matchmakinghttp.RegisterDedicatedServerRoutes(router, logger, validateTicketUC, markStartedUC)
 	return router
 }
 
@@ -352,5 +355,97 @@ func TestMatchmakingCancelFlow(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &st)
 	if st.Status != "IDLE" {
 		t.Fatalf("se esperaba status IDLE tras cancelar, se obtuvo %s", st.Status)
+	}
+}
+
+func TestDedicatedServerHTTPValidateTicketAndMarkStarted(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	jwtMgr := security.NewJWTManager("test_secret_for_dedicated_server_http_32b")
+	repo := newInMemoryMatchRepository()
+	queue := memoryqueue.NewMemoryQueue()
+
+	router := setupTestRouter(logger, jwtMgr, repo, queue)
+
+	// 1. Armar una partida 2v2 con 4 jugadores
+	var lastMatch matchResponseDTO
+	for i := 1; i <= 4; i++ {
+		playerID := "00000000-0000-0000-0000-00000000000" + string(rune('0'+i))
+		token, _ := jwtMgr.GenerateToken(playerID, "unreal_player")
+		req, _ := http.NewRequest(http.MethodPost, "/v1/matchmaking/enqueue", bytes.NewBufferString(`{"mode":"2v2"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("error encolando jugador %d: %d", i, rec.Code)
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &lastMatch)
+	}
+
+	if lastMatch.Status != "MATCH_FOUND" || lastMatch.MatchID == "" || lastMatch.JoinTicket == "" {
+		t.Fatalf("se esperaba MATCH_FOUND con match_id y join_ticket: %+v", lastMatch)
+	}
+
+	// 2. El Unreal Dedicated Server valida el ticket por HTTP (POST /v1/internal/matches/validate-ticket)
+	validatePayload := `{"trace_id":"unreal-ds-trace-001","match_id":"` + lastMatch.MatchID + `","join_ticket":"` + lastMatch.JoinTicket + `"}`
+	reqValidate, _ := http.NewRequest(http.MethodPost, "/v1/internal/matches/validate-ticket", bytes.NewBufferString(validatePayload))
+	reqValidate.Header.Set("Content-Type", "application/json")
+	recValidate := httptest.NewRecorder()
+	router.ServeHTTP(recValidate, reqValidate)
+
+	if recValidate.Code != http.StatusOK {
+		t.Fatalf("se esperaba 200 OK en validate-ticket, se obtuvo %d: %s", recValidate.Code, recValidate.Body.String())
+	}
+	if gotTrace := recValidate.Header().Get("X-Trace-ID"); gotTrace != "unreal-ds-trace-001" {
+		t.Fatalf("se esperaba X-Trace-ID 'unreal-ds-trace-001', se obtuvo %q", gotTrace)
+	}
+
+	var valResp struct {
+		Valid            bool   `json:"valid"`
+		ReasonCode       string `json:"reason_code"`
+		PlayerID         string `json:"player_id"`
+		AssignedTeam     string `json:"assigned_team"`
+		EquippedSkinCode string `json:"equipped_skin_code"`
+	}
+	if err := json.Unmarshal(recValidate.Body.Bytes(), &valResp); err != nil {
+		t.Fatalf("error parseando respuesta de validate-ticket: %v", err)
+	}
+	if !valResp.Valid || valResp.ReasonCode != "OK" {
+		t.Fatalf("se esperaba ticket válido con OK, se obtuvo: %+v", valResp)
+	}
+	if valResp.EquippedSkinCode != "bean_default" {
+		t.Fatalf("se esperaba skin 'bean_default', se obtuvo %q", valResp.EquippedSkinCode)
+	}
+
+	// 3. Reintento con el mismo ticket debe ser rechazado con TICKET_ALREADY_USED
+	reqValidateDup, _ := http.NewRequest(http.MethodPost, "/v1/internal/matches/validate-ticket", bytes.NewBufferString(validatePayload))
+	reqValidateDup.Header.Set("Content-Type", "application/json")
+	recDup := httptest.NewRecorder()
+	router.ServeHTTP(recDup, reqValidateDup)
+	var dupResp struct {
+		Valid      bool   `json:"valid"`
+		ReasonCode string `json:"reason_code"`
+	}
+	_ = json.Unmarshal(recDup.Body.Bytes(), &dupResp)
+	if dupResp.Valid || dupResp.ReasonCode != "TICKET_ALREADY_USED" {
+		t.Fatalf("se esperaba TICKET_ALREADY_USED en segundo intento, se obtuvo: %+v", dupResp)
+	}
+
+	// 4. El Unreal Dedicated Server notifica el inicio de la Ronda 1 (POST /v1/internal/matches/mark-started)
+	startPayload := `{"trace_id":"unreal-ds-trace-002","match_id":"` + lastMatch.MatchID + `","server_instance_id":"unreal-pie-local-1"}`
+	reqStart, _ := http.NewRequest(http.MethodPost, "/v1/internal/matches/mark-started", bytes.NewBufferString(startPayload))
+	reqStart.Header.Set("Content-Type", "application/json")
+	recStart := httptest.NewRecorder()
+	router.ServeHTTP(recStart, reqStart)
+
+	if recStart.Code != http.StatusOK {
+		t.Fatalf("se esperaba 200 OK en mark-started, se obtuvo %d: %s", recStart.Code, recStart.Body.String())
+	}
+	var startResp struct {
+		Success    bool   `json:"success"`
+		ResultCode string `json:"result_code"`
+	}
+	_ = json.Unmarshal(recStart.Body.Bytes(), &startResp)
+	if !startResp.Success || startResp.ResultCode != "MATCH_STARTED" {
+		t.Fatalf("se esperaba MATCH_STARTED, se obtuvo: %+v", startResp)
 	}
 }
